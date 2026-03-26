@@ -8,7 +8,7 @@ class Subscription::UpdaterService
                 :overdue_for_charge, :is_resubscribing, :is_pending_cancellation,
                 :calculate_upgrade_cost_as_of, :prorated_discount_price_cents,
                 :card_data_handling_mode, :card_data_handling_error, :chargeable,
-                :api_notification_sent
+                :api_notification_sent, :apply_product_price_change_on_resubscribe
 
   def initialize(subscription:, params:, logged_in_user:, gumroad_guid:, remote_ip:)
     @subscription = subscription
@@ -41,6 +41,7 @@ class Subscription::UpdaterService
     self.is_pending_cancellation = subscription.pending_cancellation?
     self.calculate_upgrade_cost_as_of = Time.current.end_of_day
     self.prorated_discount_price_cents = subscription.prorated_discount_price_cents(calculate_as_of: calculate_upgrade_cost_as_of)
+    self.apply_product_price_change_on_resubscribe = should_apply_product_price_change_on_resubscribe?
 
     if is_resubscribing && (subscription.cancelled_by_seller? || product.deleted?)
       return { success: false, error_message: "This subscription cannot be restarted." }
@@ -102,7 +103,7 @@ class Subscription::UpdaterService
           params[:offer_code].present?
         end
 
-        if !same_plan_and_price? || (is_resubscribing && discount_changed)
+        if !same_plan_and_price? || (is_resubscribing && (discount_changed || apply_product_price_change_on_resubscribe))
           self.new_purchase = subscription.update_current_plan!(
             new_variants: variants,
             new_price: price,
@@ -114,7 +115,7 @@ class Subscription::UpdaterService
           subscription.reload
         end
 
-        if !same_plan_and_price? || overdue_for_charge
+        if (!same_plan_and_price? || overdue_for_charge) && !apply_product_price_change_on_resubscribe
           # Validate that prices matches what the user was shown for prorated upgrade
           # price and ongoing subscription price. Skip this step if the plan is not
           # changing.
@@ -424,6 +425,31 @@ class Subscription::UpdaterService
 
     def new_plan_is_free?
       new_price_cents == 0
+    end
+
+    def should_apply_product_price_change_on_resubscribe?
+      return false unless is_resubscribing
+      return false unless tiered_membership?
+      return false unless same_plan?
+
+      tier = new_tier || product.default_tier
+      return false unless tier&.apply_price_changes_to_existing_memberships?
+      return false unless tier.subscription_price_change_effective_date.present?
+      return false unless tier.subscription_price_change_effective_date <= Date.current
+
+      existing_price = original_purchase.displayed_price_cents
+      new_price = nil
+      begin
+        ActiveRecord::Base.transaction do
+          original_purchase.set_price_and_rate
+          new_price = original_purchase.displayed_price_cents
+          raise ActiveRecord::Rollback
+        end
+      ensure
+        original_purchase.reload
+      end
+
+      new_price.present? && existing_price != new_price
     end
 
     def success_message

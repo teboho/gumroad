@@ -438,6 +438,51 @@ describe Subscription::UpdaterService, :vcr do
             expect(last_purchase.id).not_to eq @original_purchase.id
             expect(last_purchase.displayed_price_cents).to eq old_price_cents
           end
+
+          context "when applying price changes to existing memberships is enabled" do
+            let(:free_trial) { true }
+
+            it "charges the updated price and refreshes the original subscription purchase" do
+              old_price_cents = @original_tier_quarterly_price.price_cents
+              @original_tier_quarterly_price.update!(price_cents: old_price_cents + 500)
+              effective_date = 7.days.from_now.to_date
+              @original_tier.update!(
+                apply_price_changes_to_existing_memberships: true,
+                subscription_price_change_effective_date: effective_date
+              )
+
+              params = {
+                price_id: @quarterly_product_price.external_id,
+                variants: [@original_tier.external_id],
+                quantity: 1,
+                use_existing_card: true,
+                perceived_price_cents: old_price_cents,
+                perceived_upgrade_price_cents: old_price_cents,
+              }
+              service = Subscription::UpdaterService.new(
+                subscription: @subscription,
+                gumroad_guid: @gumroad_guid,
+                params:,
+                logged_in_user: @user,
+                remote_ip: @remote_ip,
+              )
+              allow(service).to receive(:charge_user!).and_return({
+                                                                    success: true,
+                                                                    success_message: "Membership restarted"
+                                                                  })
+
+              expect do
+                travel_to(effective_date + 1.day) do
+                  result = service.perform
+                  expect(result[:success]).to eq true
+                end
+              end.to change { @subscription.reload.original_purchase.id }
+
+              @subscription.reload
+              expect(@subscription.original_purchase.id).not_to eq @original_purchase.id
+              expect(@subscription.original_purchase.displayed_price_cents).to eq old_price_cents + 500
+            end
+          end
         end
 
         context "changing plans" do
